@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cifrador AES-GCM / Base64</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: monospace;
+      max-width: 600px;
+      margin: 30px auto;
+      padding: 0 15px;
+      background: #fff;
+      color: #111;
+    }
+    h2 { text-align: center; }
+    label { display: block; margin: 12px 0 6px; font-weight: bold; }
+    input, textarea, button {
+      width: 100%;
+      font: inherit;
+    }
+    input, textarea {
+      border: 1px solid #aaa;
+      border-radius: 6px;
+      padding: 10px;
+      background: #fff;
+      color: #111;
+    }
+    textarea { resize: vertical; min-height: 100px; }
+    button {
+      margin-top: 10px;
+      padding: 10px;
+      border: 0;
+      border-radius: 6px;
+      cursor: pointer;
+      background: #222;
+      color: #fff;
+    }
+    button.danger { background: #c62828; }
+    button:disabled { opacity: .6; cursor: wait; }
+    .box {
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      padding: 15px;
+      margin-top: 18px;
+    }
+    #status {
+      min-height: 20px;
+      margin-top: 10px;
+      white-space: pre-wrap;
+    }
+    .ok { color: #16803c; }
+    .error { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h2>Cifrador / Descifrador Seguro</h2>
+
+  <label for="masterKey">Clave Maestra:</label>
+  <input id="masterKey" type="password" autocomplete="off" spellcheck="false">
+  <button type="button" id="clearKeyBtn" class="danger">Borrar Clave Maestra</button>
+
+  <div class="box">
+    <h3>Cifrar Frase</h3>
+    <textarea id="plainInput" placeholder="Escribe aquí la frase que deseas cifrar..."></textarea>
+    <button type="button" id="encryptBtn">Cifrar a Base64</button>
+  </div>
+
+  <label for="cipherOutput">Texto Cifrado:</label>
+  <textarea id="cipherOutput" readonly placeholder="Aquí aparecerá el texto cifrado..."></textarea>
+
+  <div class="box">
+    <h3>Descifrar Frase</h3>
+    <textarea id="cipherInput" placeholder="Pega aquí el texto cifrado..."></textarea>
+    <button type="button" id="decryptBtn">Descifrar Frase</button>
+    <textarea id="plainOutput" readonly placeholder="Aquí aparecerá la frase descifrada..."></textarea>
+  </div>
+
+  <button type="button" id="clearAllBtn" class="danger">Borrar todos los campos</button>
+  <div id="status" aria-live="polite"></div>
+
+  <script>
+    // Cambia SOLO esta URL después de crear tu Cloudflare Worker.
+    const WORKER_URL = "https://TU-WORKER.TU-SUBDOMINIO.workers.dev";
+
+    const enc = new TextEncoder();
+    const dec = new TextDecoder();
+
+    const $ = (id) => document.getElementById(id);
+
+    function setStatus(message, type = "") {
+      const el = $("status");
+      el.textContent = message;
+      el.className = type;
+    }
+
+    function bytesToBase64(bytes) {
+      let binary = "";
+      const chunk = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+      }
+      return btoa(binary);
+    }
+
+    function base64ToBytes(base64) {
+      const binary = atob(base64.trim());
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return bytes;
+    }
+
+    async function deriveKey(passphrase, salt) {
+      const material = await crypto.subtle.importKey(
+        "raw",
+        enc.encode(passphrase),
+        "PBKDF2",
+        false,
+        ["deriveKey"]
+      );
+
+      return crypto.subtle.deriveKey(
+        {
+          name: "PBKDF2",
+          salt,
+          iterations: 100000,
+          hash: "SHA-256"
+        },
+        material,
+        { name: "AES-GCM", length: 256 },
+        false,
+        ["encrypt", "decrypt"]
+      );
+    }
+
+    async function encryptDataKey(dataKeyBytes, passphrase, salt, iv) {
+      const key = await deriveKey(passphrase, salt);
+      return new Uint8Array(await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv },
+        key,
+        dataKeyBytes
+      ));
+    }
+
+    async function decryptDataKey(encDataKey, passphrase, salt, iv) {
+      const key = await deriveKey(passphrase, salt);
+      return new Uint8Array(await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv },
+        key,
+        encDataKey
+      ));
+    }
+
+    async function worker(path, body) {
+      if (WORKER_URL.includes("TU-WORKER")) {
+        throw new Error("Primero configura WORKER_URL en index.html con la URL de tu Cloudflare Worker.");
+      }
+
+      const response = await fetch(WORKER_URL + path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+
+      let data = null;
+      try { data = await response.json(); } catch (_) {}
+
+      if (!response.ok) {
+        throw new Error(data?.error || "El servidor no pudo completar la operación.");
+      }
+      return data;
+    }
+
+    async function cifrar() {
+      const passphrase = $("masterKey").value;
+      const plaintext = $("plainInput").value;
+
+      if (!passphrase) {
+        setStatus("Introduce una Clave Maestra.", "error");
+        return;
+      }
+      if (!plaintext) {
+        setStatus("Introduce una frase para cifrar.", "error");
+        return;
+      }
+
+      const btn = $("encryptBtn");
+      btn.disabled = true;
+      setStatus("Cifrando...", "");
+
+      try {
+        // Clave aleatoria que cifra realmente la frase.
+        const dataKeyBytes = crypto.getRandomValues(new Uint8Array(32));
+        const dataKey = await crypto.subtle.importKey(
+          "raw",
+          dataKeyBytes,
+          { name: "AES-GCM" },
+          false,
+          ["encrypt", "decrypt"]
+        );
+
+        const ivData = crypto.getRandomValues(new Uint8Array(12));
+        const payload = new Uint8Array(await crypto.subtle.encrypt(
+          { name: "AES-GCM", iv: ivData },
+          dataKey,
+          enc.encode(plaintext)
+        ));
+
+        // Primera vía: la Clave Maestra introducida por el usuario.
+        const saltUser = crypto.getRandomValues(new Uint8Array(16));
+        const ivUser = crypto.getRandomValues(new Uint8Array(12));
+        const encKeyUser = await encryptDataKey(dataKeyBytes, passphrase, saltUser, ivUser);
+
+        // Segunda vía: clave interna almacenada en Cloudflare, nunca en este archivo.
+        const backup = await worker("/backup/wrap", {
+          dataKey: bytesToBase64(dataKeyBytes)
+        });
+
+        const parts = [
+          saltUser,
+          ivUser,
+          encKeyUser,
+          base64ToBytes(backup.salt),
+          base64ToBytes(backup.iv),
+          base64ToBytes(backup.encKey),
+          ivData,
+          payload
+        ];
+
+        const totalLength = parts.reduce((sum, part) => sum + part.length, 0);
+        const packed = new Uint8Array(totalLength);
+        let offset = 0;
+        for (const part of parts) {
+          packed.set(part, offset);
+          offset += part.length;
+        }
+
+        const ciphertext = bytesToBase64(packed);
+        $("cipherOutput").value = ciphertext;
+        $("cipherInput").value = ciphertext;
+
+        // Telegram recibe únicamente el texto cifrado, nunca la frase original.
+        await worker("/telegram/send", { text: ciphertext });
+
+        setStatus("Cifrado correctamente y copia enviada a Telegram.", "ok");
+      } catch (error) {
+        console.error(error);
+        setStatus("No se pudo cifrar: " + error.message, "error");
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function descifrar() {
+      const passphrase = $("masterKey").value;
+      const ciphertext = $("cipherInput").value.trim();
+
+      if (!passphrase) {
+        setStatus("Introduce una Clave Maestra.", "error");
+        return;
+      }
+      if (!ciphertext) {
+        setStatus("Introduce el Texto Cifrado.", "error");
+        return;
+      }
+
+      const btn = $("decryptBtn");
+      btn.disabled = true;
+      setStatus("Intentando descifrar...", "");
+
+      try {
+        const data = base64ToBytes(ciphertext);
+
+        // Formato fijo de la cabecera:
+        // saltUser 16 | ivUser 12 | encKeyUser 48 |
+        // saltBackup 16 | ivBackup 12 | encKeyBackup 48 |
+        // ivData 12 | payload variable
+        const minimum = 16 + 12 + 48 + 16 + 12 + 48 + 12 + 1;
+        if (data.length < minimum) throw new Error("Texto cifrado inválido o incompleto.");
+
+        let offset = 0;
+        const take = (length) => {
+          const result = data.slice(offset, offset + length);
+          offset += length;
+          return result;
+        };
+
+        const saltUser = take(16);
+        const ivUser = take(12);
+        const encKeyUser = take(48);
+        const saltBackup = take(16);
+        const ivBackup = take(12);
+        const encKeyBackup = take(48);
+        const ivData = take(12);
+        const payload = take(data.length - offset);
+
+        let dataKeyBytes;
+
+        // PRIMERA VÍA: se prueba exclusivamente la clave que el usuario escribió.
+        try {
+          dataKeyBytes = await decryptDataKey(encKeyUser, passphrase, saltUser, ivUser);
+        } catch (_) {
+          // SEGUNDA VÍA: se manda ESA MISMA clave escrita por el usuario al Worker.
+          // El Worker intenta descifrar el segundo bloque. No obtiene/inserta la clave por sí mismo.
+          const result = await worker("/backup/unwrap", {
+            passphrase,
+            salt: bytesToBase64(saltBackup),
+            iv: bytesToBase64(ivBackup),
+            encKey: bytesToBase64(encKeyBackup)
+          });
+          dataKeyBytes = base64ToBytes(result.dataKey);
+        }
+
+        const dataKey = await crypto.subtle.importKey(
+          "raw",
+          dataKeyBytes,
+          { name: "AES-GCM" },
+          false,
+          ["decrypt"]
+        );
+
+        const plaintext = await crypto.subtle.decrypt(
+          { name: "AES-GCM", iv: ivData },
+          dataKey,
+          payload
+        );
+
+        $("plainOutput").value = dec.decode(plaintext);
+        setStatus("Descifrado correctamente.", "ok");
+      } catch (error) {
+        console.error(error);
+        $("plainOutput").value = "";
+        setStatus("No se pudo descifrar. Comprueba la Clave Maestra y el Texto Cifrado.", "error");
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    function borrarTodosLosCampos() {
+      $("masterKey").value = "";
+      $("plainInput").value = "";
+      $("cipherOutput").value = "";
+      $("cipherInput").value = "";
+      $("plainOutput").value = "";
+      setStatus("", "");
+    }
+
+    $("clearKeyBtn").addEventListener("click", () => {
+      $("masterKey").value = "";
+      setStatus("Clave Maestra borrada.", "");
+    });
+    $("encryptBtn").addEventListener("click", cifrar);
+    $("decryptBtn").addEventListener("click", descifrar);
+    $("clearAllBtn").addEventListener("click", borrarTodosLosCampos);
+  </script>
+</body>
+</html>
